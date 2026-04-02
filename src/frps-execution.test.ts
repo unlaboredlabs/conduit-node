@@ -30,8 +30,16 @@ test("executeJob provisions FRPS after ensuring the reserved IP alias exists", a
   );
   const removeReservedIpFromHost = mock(async () => true);
   const getReservedIpLease = mock(async () => null);
-  const removeReservedIpLease = mock(async () => undefined);
-  const upsertReservedIpLease = mock(async () => undefined);
+  const removeReservedIpLease = mock(async () => null);
+  const upsertReservedIpLease = mock(
+    async (
+      _config: AgentConfig,
+      input: { frpsId: string; address: string; status: "pending" | "active" | "deleting" },
+    ) => ({
+      ...input,
+      updatedAt: Date.now(),
+    }),
+  );
   const probeContainerRunning = mock(async () => true);
   const removeContainer = mock(async () => undefined);
   const runFrpsContainer = mock(async () => undefined);
@@ -102,5 +110,111 @@ test("executeJob provisions FRPS after ensuring the reserved IP alias exists", a
     await new Promise<void>((resolve, reject) =>
       probeServer.close((error) => (error ? reject(error) : resolve())),
     );
+  }
+});
+
+test("executeJob retries the FRPS readiness probe while the listener is still starting", async () => {
+  const ensureReservedIpOnHost = mock(
+    async () =>
+      ({
+        iface: "eth0",
+        added: true,
+      }) as const,
+  );
+  const removeReservedIpFromHost = mock(async () => true);
+  const getReservedIpLease = mock(async () => null);
+  const removeReservedIpLease = mock(async () => null);
+  const upsertReservedIpLease = mock(
+    async (
+      _config: AgentConfig,
+      input: { frpsId: string; address: string; status: "pending" | "active" | "deleting" },
+    ) => ({
+      ...input,
+      updatedAt: Date.now(),
+    }),
+  );
+  const probeContainerRunning = mock(async () => true);
+  const removeContainer = mock(async () => undefined);
+  const stopContainer = mock(async () => undefined);
+
+  const portReservation = createServer();
+  await new Promise<void>((resolve) =>
+    portReservation.listen(0, "127.0.0.1", resolve),
+  );
+  const address = portReservation.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Failed to reserve probe port.");
+  }
+  const bindPort = address.port;
+  await new Promise<void>((resolve, reject) =>
+    portReservation.close((error) => (error ? reject(error) : resolve())),
+  );
+
+  const delayedServer = createServer((socket) => socket.end());
+  const runFrpsContainer = mock(async () => {
+    setTimeout(() => {
+      delayedServer.listen(bindPort, "127.0.0.1");
+    }, 200);
+  });
+
+  const config: AgentConfig = {
+    controllerUrl: "https://conduit.invalid",
+    registrationToken: null,
+    label: "edge-node",
+    hostname: "edge-node-01",
+    vultrInstanceId: "instance-123",
+    region: "dfw",
+    stateDir,
+    stateFile: path.join(stateDir, "node-state.json"),
+    frpsConfigDir,
+    reservedIpStateFile: path.join(stateDir, "reserved-ips.json"),
+    heartbeatSeconds: 15,
+    jobPollSeconds: 10,
+    agentVersion: "0.1.0",
+  };
+
+  const job: AgentJob = {
+    _id: "job_456",
+    kind: "provision_frps",
+    attemptCount: 1,
+    payload: {
+      frpsId: "frps_456",
+      name: "edge-frps-delayed",
+      containerName: "conduit-frps-edge-delayed",
+      reservedIp: "127.0.0.1",
+      bindPort,
+      proxyPortStart: 1024,
+      proxyPortEnd: 49151,
+      authToken: "secret-token",
+      image: "ghcr.io/fatedier/frps:v0.65.0",
+    },
+  };
+
+  try {
+    const completion = await executeJob(config, job, {
+      ensureReservedIpOnHost,
+      removeReservedIpFromHost,
+      getReservedIpLease,
+      removeReservedIpLease,
+      upsertReservedIpLease,
+      probeContainerRunning,
+      removeContainer,
+      runFrpsContainer,
+      stopContainer,
+    });
+
+    expect(runFrpsContainer).toHaveBeenCalledTimes(1);
+    expect(completion).toEqual({
+      status: "succeeded",
+      message: "provision_frps succeeded",
+      containerName: "conduit-frps-edge-delayed",
+    });
+    expect(removeContainer).not.toHaveBeenCalled();
+  } finally {
+    if (delayedServer.listening) {
+      await new Promise<void>((resolve, reject) =>
+        delayedServer.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
   }
 });

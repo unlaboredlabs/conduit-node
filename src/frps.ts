@@ -50,7 +50,7 @@ export const renderFrpsConfig = (job: AgentJob) => {
 const configPathForJob = (config: AgentConfig, job: AgentJob) =>
   path.join(config.frpsConfigDir, `${job.payload.frpsId}.toml`);
 
-const probeTcp = async (host: string, port: number, timeoutMs = 5_000) =>
+const probeTcpOnce = async (host: string, port: number, timeoutMs: number) =>
   await new Promise<void>((resolve, reject) => {
     const socket = connect({ host, port });
     const timeout = setTimeout(() => {
@@ -70,6 +70,47 @@ const probeTcp = async (host: string, port: number, timeoutMs = 5_000) =>
       reject(error);
     });
   });
+
+const probeTcp = async (
+  host: string,
+  port: number,
+  timeoutMs = 20_000,
+  retryDelayMs = 500,
+) => {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: Error | null = null;
+
+  while (Date.now() < deadline) {
+    try {
+      await probeTcpOnce(host, port, Math.min(5_000, Math.max(1, deadline - Date.now())));
+      return;
+    } catch (error) {
+      lastError =
+        error instanceof Error ? error : new Error(`Failed probing ${host}:${port}`);
+
+      if (
+        !(
+          "code" in lastError &&
+          (lastError.code === "ECONNREFUSED" ||
+            lastError.code === "EHOSTUNREACH" ||
+            lastError.code === "ENETUNREACH" ||
+            lastError.code === "EADDRNOTAVAIL")
+        ) &&
+        !lastError.message.startsWith("Timed out probing")
+      ) {
+        throw lastError;
+      }
+
+      if (Date.now() >= deadline) {
+        break;
+      }
+
+      await Bun.sleep(retryDelayMs);
+    }
+  }
+
+  throw lastError ?? new Error(`Timed out probing ${host}:${port}`);
+};
 
 const startLikeProvision = async (
   config: AgentConfig,
